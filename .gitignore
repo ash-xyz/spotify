@@ -1,0 +1,16 @@
+# Fly.io specific files
+.fly/
+
+# Build artifacts
+.dockerignore
+Dockerfile
+.docker/
+
+# Local development
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
