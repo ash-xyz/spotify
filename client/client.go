@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,8 +31,17 @@ type Options struct {
 	ClientSecret string
 	RefreshToken string
 	Limit        string
-	TimeRange    string
+	TimeRange    TimeRange
 }
+
+type TimeRange string
+
+const (
+	TimeRangeTag           = "time_range"
+	ShortTerm    TimeRange = "short_term"
+	MediumTerm   TimeRange = "medium_term"
+	LongTerm     TimeRange = "long_term"
+)
 
 func WithClientID(clientID string) func(*Options) {
 	return func(o *Options) {
@@ -52,15 +62,15 @@ func WithRefreshToken(refreshToken string) func(*Options) {
 }
 
 // Determines limit of tracks, artists and recently played songs to be fetched
-func WithLimit(limit string) func(*Options) {
+func WithLimit(limit int) func(*Options) {
 	return func(o *Options) {
-		o.Limit = limit //TODO: range is 0-50, let's do some validation on this
+		o.Limit = fmt.Sprintf("%d", limit) //TODO: range is 0-50, let's do some validation on this
 	}
 }
 
-func WithTimeRange(timeRange string) func(*Options) {
+func WithTimeRange(timeRange TimeRange) func(*Options) {
 	return func(o *Options) {
-		o.TimeRange = timeRange // TODO: this is either short_term, medium_term or long_term (Let's make this an enum/type)
+		o.TimeRange = timeRange
 	}
 }
 
@@ -170,7 +180,7 @@ func (s *SpotifyClient) GetTopTrack() (*TopTracks, error) {
 
 	params := url.Values{
 		"limit":      {s.options.Limit},
-		"time_range": {s.options.TimeRange},
+		TimeRangeTag: {string(s.options.TimeRange)},
 	}
 
 	err := s.doRequest(topTracksURL, params, tt)
@@ -185,7 +195,7 @@ func (s *SpotifyClient) GetTopTracks() (*TopTracks, error) {
 
 	params := url.Values{
 		"limit":      {s.options.Limit},
-		"time_range": {s.options.TimeRange},
+		TimeRangeTag: {string(s.options.TimeRange)},
 	}
 
 	err := s.doRequest(topTracksURL, params, tt)
