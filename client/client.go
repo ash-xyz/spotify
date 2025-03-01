@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -20,8 +21,8 @@ const (
 )
 
 type SpotifyClient struct {
-	client *http.Client
-	limit  string
+	client  *http.Client
+	options *Options
 }
 
 type Options struct {
@@ -29,6 +30,7 @@ type Options struct {
 	ClientSecret string
 	RefreshToken string
 	Limit        string
+	TimeRange    string
 }
 
 func WithClientID(clientID string) func(*Options) {
@@ -52,13 +54,20 @@ func WithRefreshToken(refreshToken string) func(*Options) {
 // Determines limit of tracks, artists and recently played songs to be fetched
 func WithLimit(limit string) func(*Options) {
 	return func(o *Options) {
-		o.Limit = limit
+		o.Limit = limit //TODO: range is 0-50, let's do some validation on this
+	}
+}
+
+func WithTimeRange(timeRange string) func(*Options) {
+	return func(o *Options) {
+		o.TimeRange = timeRange // TODO: this is either short_term, medium_term or long_term (Let's make this an enum/type)
 	}
 }
 
 func NewSpotifyClient(opts ...func(*Options)) *SpotifyClient {
 	options := &Options{
 		Limit:        "5",
+		TimeRange:    "short_term",
 		ClientID:     os.Getenv("SPOTIFY_CLIENT_ID"),
 		ClientSecret: os.Getenv("SPOTIFY_CLIENT_SECRET"),
 		RefreshToken: os.Getenv("SPOTIFY_REFRESH_TOKEN"),
@@ -83,8 +92,8 @@ func NewSpotifyClient(opts ...func(*Options)) *SpotifyClient {
 	client.Timeout = 10 * time.Second
 
 	return &SpotifyClient{
-		client: client,
-		limit:  options.Limit,
+		client:  client,
+		options: options,
 	}
 }
 
@@ -144,7 +153,12 @@ func (s *SpotifyClient) GetCurrentlyPlaying() (*CurrentlyPlaying, error) {
 
 func (s *SpotifyClient) GetRecentlyPlayed() (*RecentlyPlayedTracks, error) {
 	rp := &RecentlyPlayedTracks{}
-	err := s.doRequest(recentlyPlayedURL, rp)
+
+	params := url.Values{
+		"limit": {s.options.Limit},
+	}
+
+	err := s.doRequest(recentlyPlayedURL, params, rp)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +167,13 @@ func (s *SpotifyClient) GetRecentlyPlayed() (*RecentlyPlayedTracks, error) {
 
 func (s *SpotifyClient) GetTopTrack() (*TopTracks, error) {
 	tt := &TopTracks{}
-	err := s.doRequest(topTracksURL, tt)
+
+	params := url.Values{
+		"limit":      {s.options.Limit},
+		"time_range": {s.options.TimeRange},
+	}
+
+	err := s.doRequest(topTracksURL, params, tt)
 	if err != nil {
 		return nil, err
 	}
@@ -162,22 +182,28 @@ func (s *SpotifyClient) GetTopTrack() (*TopTracks, error) {
 
 func (s *SpotifyClient) GetTopTracks() (*TopTracks, error) {
 	tt := &TopTracks{}
-	err := s.doRequest(topTracksURL, tt)
+
+	params := url.Values{
+		"limit":      {s.options.Limit},
+		"time_range": {s.options.TimeRange},
+	}
+
+	err := s.doRequest(topTracksURL, params, tt)
 	if err != nil {
 		return nil, err
 	}
 	return tt, nil
 }
 
-func (s *SpotifyClient) doRequest(url string, result interface{}) error {
+func (s *SpotifyClient) doRequest(url string, params url.Values, result interface{}) error {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
 
-	q := req.URL.Query()
-	q.Add("limit", s.limit)
-	req.URL.RawQuery = q.Encode()
+	if params != nil {
+		req.URL.RawQuery = params.Encode()
+	}
 
 	r, err := s.client.Do(req)
 	if err != nil {
