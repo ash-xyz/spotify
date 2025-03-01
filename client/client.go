@@ -107,39 +107,6 @@ func NewSpotifyClient(opts ...func(*Options)) *SpotifyClient {
 	}
 }
 
-type Track struct {
-	Name         string            `json:"name"`
-	Artists      []Artist          `json:"artists"`
-	ExternalURLs map[string]string `json:"external_urls"`
-}
-
-type Artist struct {
-	Name         string            `json:"name"`
-	ExternalURLs map[string]string `json:"external_urls"`
-}
-
-type CurrentlyPlaying struct {
-	Progress int   `json:"progress_ms"`
-	Item     Track `json:"item"`
-}
-
-type RecentlyPlayed struct {
-	Tracks Track `json:"track"`
-	// PlayedAt time.Time `json:"played_at"`
-}
-
-type RecentlyPlayedTracks struct {
-	RecentlyPlayed []RecentlyPlayed `json:"items"`
-}
-
-type TopTracks struct {
-	Tracks []Track `json:"items"`
-}
-
-type TopArtists struct {
-	Artists []Artist `json:"items"`
-}
-
 func (s *SpotifyClient) GetCurrentlyPlaying() (*CurrentlyPlaying, error) {
 	r, err := s.client.Get(currentURL)
 	if err != nil {
@@ -151,18 +118,18 @@ func (s *SpotifyClient) GetCurrentlyPlaying() (*CurrentlyPlaying, error) {
 		return nil, nil
 	}
 
-	cp := &CurrentlyPlaying{}
+	cp := &SpotifyCurrentlyPlaying{}
 	err = json.NewDecoder(r.Body).Decode(cp)
 
 	if err != nil {
 		return nil, err
 	}
 
-	return cp, nil
+	return cp.Convert(), nil
 }
 
 func (s *SpotifyClient) GetRecentlyPlayed() (*RecentlyPlayedTracks, error) {
-	rp := &RecentlyPlayedTracks{}
+	rp := &SpotifyRecentlyPlayedTracks{}
 
 	params := url.Values{
 		"limit": {s.options.Limit},
@@ -172,26 +139,26 @@ func (s *SpotifyClient) GetRecentlyPlayed() (*RecentlyPlayedTracks, error) {
 	if err != nil {
 		return nil, err
 	}
-	return rp, nil
+	return rp.Convert(), nil
 }
 
-func (s *SpotifyClient) GetTopTrack() (*TopTracks, error) {
-	tt := &TopTracks{}
+func (s *SpotifyClient) GetTopArtists() (*TopArtists, error) {
+	ta := &SpotifyTopArtists{}
 
 	params := url.Values{
 		"limit":      {s.options.Limit},
 		TimeRangeTag: {string(s.options.TimeRange)},
 	}
 
-	err := s.doRequest(topTracksURL, params, tt)
+	err := s.doRequest(topArtistsURL, params, ta)
 	if err != nil {
 		return nil, err
 	}
-	return tt, nil
+	return ta.Convert(), nil
 }
 
 func (s *SpotifyClient) GetTopTracks() (*TopTracks, error) {
-	tt := &TopTracks{}
+	tt := &SpotifyTopTracks{}
 
 	params := url.Values{
 		"limit":      {s.options.Limit},
@@ -202,7 +169,7 @@ func (s *SpotifyClient) GetTopTracks() (*TopTracks, error) {
 	if err != nil {
 		return nil, err
 	}
-	return tt, nil
+	return tt.Convert(), nil
 }
 
 func (s *SpotifyClient) doRequest(url string, params url.Values, result interface{}) error {
