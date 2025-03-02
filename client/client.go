@@ -15,7 +15,7 @@ import (
 
 const (
 	spotifyBaseURL    = "https://api.spotify.com/v1"
-	currentURL        = spotifyBaseURL + "/me/player/currently-playing"
+	currentlyPlaying  = spotifyBaseURL + "/me/player/currently-playing"
 	recentlyPlayedURL = spotifyBaseURL + "/me/player/recently-played"
 	topTracksURL      = spotifyBaseURL + "/me/top/tracks"
 	topArtistsURL     = spotifyBaseURL + "/me/top/artists"
@@ -107,42 +107,39 @@ func NewSpotifyClient(opts ...func(*Options)) *SpotifyClient {
 	}
 }
 
-func (s *SpotifyClient) GetCurrentlyPlaying() (*CurrentlyPlaying, error) {
-	r, err := s.client.Get(currentURL)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Body.Close()
-
-	if r.StatusCode == http.StatusNoContent {
-		return nil, nil
-	}
-
+func (s *SpotifyClient) GetCurrentlyPlaying(ctx context.Context) (*CurrentlyPlaying, error) {
 	cp := &SpotifyCurrentlyPlaying{}
-	err = json.NewDecoder(r.Body).Decode(cp)
+	params := url.Values{
+		"limit": {s.options.Limit},
+	}
 
+	err := s.doRequest(ctx, currentlyPlaying, params, cp)
 	if err != nil {
 		return nil, err
+	}
+
+	if cp.Item == nil {
+		return nil, nil
 	}
 
 	return cp.Convert(), nil
 }
 
-func (s *SpotifyClient) GetRecentlyPlayed() (*RecentlyPlayedTracks, error) {
+func (s *SpotifyClient) GetRecentlyPlayed(ctx context.Context) (*RecentlyPlayedTracks, error) {
 	rp := &SpotifyRecentlyPlayedTracks{}
 
 	params := url.Values{
 		"limit": {s.options.Limit},
 	}
 
-	err := s.doRequest(recentlyPlayedURL, params, rp)
+	err := s.doRequest(ctx, recentlyPlayedURL, params, rp)
 	if err != nil {
 		return nil, err
 	}
 	return rp.Convert(), nil
 }
 
-func (s *SpotifyClient) GetTopArtists() (*TopArtists, error) {
+func (s *SpotifyClient) GetTopArtists(ctx context.Context) (*TopArtists, error) {
 	ta := &SpotifyTopArtists{}
 
 	params := url.Values{
@@ -150,14 +147,14 @@ func (s *SpotifyClient) GetTopArtists() (*TopArtists, error) {
 		TimeRangeTag: {string(s.options.TimeRange)},
 	}
 
-	err := s.doRequest(topArtistsURL, params, ta)
+	err := s.doRequest(ctx, topArtistsURL, params, ta)
 	if err != nil {
 		return nil, err
 	}
 	return ta.Convert(), nil
 }
 
-func (s *SpotifyClient) GetTopTracks() (*TopTracks, error) {
+func (s *SpotifyClient) GetTopTracks(ctx context.Context) (*TopTracks, error) {
 	tt := &SpotifyTopTracks{}
 
 	params := url.Values{
@@ -165,15 +162,15 @@ func (s *SpotifyClient) GetTopTracks() (*TopTracks, error) {
 		TimeRangeTag: {string(s.options.TimeRange)},
 	}
 
-	err := s.doRequest(topTracksURL, params, tt)
+	err := s.doRequest(ctx, topTracksURL, params, tt)
 	if err != nil {
 		return nil, err
 	}
 	return tt.Convert(), nil
 }
 
-func (s *SpotifyClient) doRequest(url string, params url.Values, result interface{}) error {
-	req, err := http.NewRequest("GET", url, nil)
+func (s *SpotifyClient) doRequest(ctx context.Context, url string, params url.Values, result interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
@@ -187,6 +184,10 @@ func (s *SpotifyClient) doRequest(url string, params url.Values, result interfac
 		return err
 	}
 	defer r.Body.Close()
+
+	if r.StatusCode == http.StatusNoContent {
+		return nil
+	}
 
 	err = json.NewDecoder(r.Body).Decode(result)
 	if err != nil {
