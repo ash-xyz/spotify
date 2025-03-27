@@ -5,42 +5,81 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/ash-xyz/spotify/client"
 	"github.com/joho/godotenv"
 )
 
 type SpotifyInfo struct {
-	TopArtists       client.TopArtists           `json:"top_artists"`
-	TopSongs         client.TopTracks            `json:"top_tracks"`
-	CurrentlyPlaying client.CurrentlyPlaying     `json:"currently_playing"`
-	RecentlyPlayed   client.RecentlyPlayedTracks `json:"recently_played"`
+	TopArtists       *client.TopArtists           `json:"top_artists"`
+	TopSongs         *client.TopTracks            `json:"top_tracks"`
+	CurrentlyPlaying *client.CurrentlyPlaying     `json:"currently_playing"`
+	RecentlyPlayed   *client.RecentlyPlayedTracks `json:"recently_played"`
 }
+
+type request func(ctx context.Context) (interface{}, error)
 
 func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) (string, error) {
 	// TODO: We should utilize caching
-	// TODO: We should use concurrency to fetch all data simultaneously
-	_, err := client.GetCurrentlyPlaying(ctx)
+
+	var wg sync.WaitGroup
+
+	spotifyInfo := SpotifyInfo{}
+	wg.Add(4)
+
+	go func() {
+		defer wg.Done()
+		currentlyPlaying, err := client.GetCurrentlyPlaying(ctx)
+		if err != nil {
+			spotifyInfo.CurrentlyPlaying = nil
+			fmt.Println(err) //TODO: Handle error properly
+		} else {
+			spotifyInfo.CurrentlyPlaying = currentlyPlaying
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		topArtists, err := client.GetTopArtists(ctx)
+		if err != nil {
+			spotifyInfo.TopArtists = nil
+			fmt.Println(err) //TODO: Handle error properly
+		} else {
+			spotifyInfo.TopArtists = topArtists
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		topTracks, err := client.GetTopTracks(ctx)
+		if err != nil {
+			spotifyInfo.TopSongs = nil
+			fmt.Println(err) //TODO: Handle error properly
+		} else {
+			spotifyInfo.TopSongs = topTracks
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		recentlyPlayed, err := client.GetRecentlyPlayed(ctx)
+		if err != nil {
+			spotifyInfo.RecentlyPlayed = nil
+			fmt.Println(err) //TODO: Handle error properly
+		} else {
+			spotifyInfo.RecentlyPlayed = recentlyPlayed
+		}
+	}()
+
+	wg.Wait()
+
+	jsonData, err := json.MarshalIndent(spotifyInfo, "", "  ")
 	if err != nil {
 		return "", err
 	}
 
-	_, err = client.GetTopArtists(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	_, err = client.GetTopTracks(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	_, err = client.GetRecentlyPlayed(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	return "", nil
+	return string(jsonData), nil
 }
 
 func apiHandler(client *client.SpotifyClient) {
@@ -59,19 +98,13 @@ func main() {
 	}
 
 	spotifyClient := client.NewSpotifyClient()
-	data, err := spotifyClient.GetCurrentlyPlaying(context.Background())
+	data, err := getSpotifyDataAsJSON(spotifyClient, context.Background())
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	js, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	fmt.Println(string(js))
+	fmt.Println(data)
 
 	// apiHandler(spotifyClient)
 
