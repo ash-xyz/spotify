@@ -18,8 +18,6 @@ type SpotifyInfo struct {
 	RecentlyPlayed   *client.RecentlyPlayedTracks `json:"recently_played"`
 }
 
-type request func(ctx context.Context) (interface{}, error)
-
 func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) (string, error) {
 	// TODO: We should utilize caching
 
