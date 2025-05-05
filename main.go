@@ -4,10 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/ash-xyz/spotify/client"
+	chi "github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
 )
 
@@ -18,8 +23,21 @@ type SpotifyInfo struct {
 	RecentlyPlayed   *client.RecentlyPlayedTracks `json:"recently_played"`
 }
 
-func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) (string, error) {
-	// TODO: We should utilize caching
+var (
+	cache      []byte
+	cacheMutex sync.Mutex
+	cacheTime  time.Time
+)
+
+func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) ([]byte, error) {
+	cacheMutex.Lock()
+
+	if cache != nil && time.Since(cacheTime) < 3*time.Minute {
+		cacheMutex.Unlock()
+		return cache, nil
+	}
+
+	cacheMutex.Unlock()
 
 	var wg sync.WaitGroup
 
@@ -74,17 +92,39 @@ func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) (st
 
 	jsonData, err := json.MarshalIndent(spotifyInfo, "", "  ")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return string(jsonData), nil
+	cacheMutex.Lock()
+
+	cache = make([]byte, len(jsonData))
+	copy(cache, jsonData)
+	cacheTime = time.Now()
+
+	cacheMutex.Unlock()
+
+	return jsonData, nil
 }
 
-func apiHandler(client *client.SpotifyClient) {
-	http.HandleFunc("/api", func(w http.ResponseWriter, r *http.Request) {
-		// data, err := getSpotifyDataAsJSON(client)
+func apiHandler(client *client.SpotifyClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data, err := getSpotifyDataAsJSON(client, context.Background())
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("Error retrieving data"))
+		}
+
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("TODO"))
+		w.Write(data)
+	}
+}
+
+func getCorsHandler() func(next http.Handler) http.Handler {
+	return cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:8080"}, // TODO: Create a development mode for this
+		AllowedMethods:   []string{"GET"},
+		AllowCredentials: false,
 	})
 }
 
@@ -95,16 +135,18 @@ func main() {
 		return
 	}
 
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Use(getCorsHandler())
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Hello chi ☕!"))
+	})
+
+	log.Println("Creating Spotify Client 🔨")
 	spotifyClient := client.NewSpotifyClient()
-	data, err := getSpotifyDataAsJSON(spotifyClient, context.Background())
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
+	log.Println("Spotify Client Created! ✅")
 
-	fmt.Println(data)
+	r.Get("/api", apiHandler(spotifyClient))
 
-	// apiHandler(spotifyClient)
-
-	// http.ListenAndServe(":8080", nil)
+	http.ListenAndServe(":8080", r)
 }
