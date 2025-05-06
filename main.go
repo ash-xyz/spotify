@@ -44,12 +44,15 @@ func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) ([]
 	spotifyInfo := SpotifyInfo{}
 	wg.Add(4)
 
+	errorChannel := make(chan error, 4)
+
 	go func() {
 		defer wg.Done()
 		currentlyPlaying, err := client.GetCurrentlyPlaying(ctx)
 		if err != nil {
 			spotifyInfo.CurrentlyPlaying = nil
-			fmt.Println(err) //TODO: Handle error properly
+			log.Printf("Error fetching currently playing: %v", err)
+			errorChannel <- fmt.Errorf("failed to fetch currently playing: %w", err)
 		} else {
 			spotifyInfo.CurrentlyPlaying = currentlyPlaying
 		}
@@ -60,7 +63,8 @@ func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) ([]
 		topArtists, err := client.GetTopArtists(ctx)
 		if err != nil {
 			spotifyInfo.TopArtists = nil
-			fmt.Println(err) //TODO: Handle error properly
+			log.Printf("Error fetching top artists: %v", err)
+			errorChannel <- fmt.Errorf("failed to fetch top artists: %w", err)
 		} else {
 			spotifyInfo.TopArtists = topArtists
 		}
@@ -71,7 +75,8 @@ func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) ([]
 		topTracks, err := client.GetTopTracks(ctx)
 		if err != nil {
 			spotifyInfo.TopSongs = nil
-			fmt.Println(err) //TODO: Handle error properly
+			log.Printf("Error fetching top tracks: %v", err)
+			errorChannel <- fmt.Errorf("failed to fetch top tracks: %w", err)
 		} else {
 			spotifyInfo.TopSongs = topTracks
 		}
@@ -82,13 +87,19 @@ func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) ([]
 		recentlyPlayed, err := client.GetRecentlyPlayed(ctx)
 		if err != nil {
 			spotifyInfo.RecentlyPlayed = nil
-			fmt.Println(err) //TODO: Handle error properly
+			log.Printf("Error fetching recently played: %v", err)
+			errorChannel <- fmt.Errorf("failed to fetch recently played: %w", err)
 		} else {
 			spotifyInfo.RecentlyPlayed = recentlyPlayed
 		}
 	}()
 
 	wg.Wait()
+	close(errorChannel)
+
+	for err := range errorChannel {
+		return nil, err
+	}
 
 	jsonData, err := json.MarshalIndent(spotifyInfo, "", "  ")
 	if err != nil {
