@@ -186,7 +186,7 @@ func runServer() error {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(internal.SecurityHeaders)
-	r.Use(internal.CORS([]string{"https://ash.xyz"}))
+	r.Use(internal.CORS([]string{"https://ash.xyz", "https://www.ash.xyz"}))
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("This is a little project I'm working on 🎶☕!"))
