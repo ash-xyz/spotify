@@ -3,16 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ash-xyz/spotify/client"
+	"github.com/ash-xyz/spotify/internal"
 	chi "github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
 )
 
@@ -33,8 +37,10 @@ func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) ([]
 	cacheMutex.Lock()
 
 	if cache != nil && time.Since(cacheTime) < 3*time.Minute {
+		result := make([]byte, len(cache))
+		copy(result, cache)
 		cacheMutex.Unlock()
-		return cache, nil
+		return result, nil
 	}
 
 	cacheMutex.Unlock()
@@ -124,6 +130,7 @@ func apiHandler(client *client.SpotifyClient) http.HandlerFunc {
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte("Error retrieving data"))
+			return
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -131,33 +138,193 @@ func apiHandler(client *client.SpotifyClient) http.HandlerFunc {
 	}
 }
 
-func getCorsHandler() func(next http.Handler) http.Handler {
-	return cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"http://localhost:8080"}, // TODO: Create a development mode for this
-		AllowedMethods:   []string{"GET"},
-		AllowCredentials: false,
-	})
-}
-
-func main() {
-	// TODO: reconsider this for deployment
-	if err := godotenv.Load(); err != nil {
-		fmt.Println("Error loading from .env file")
-		return
+func assertEnvVariablesExist() error {
+	requiredVars := []string{
+		"SPOTIFY_CLIENT_ID",
+		"SPOTIFY_CLIENT_SECRET",
+		"SPOTIFY_REFRESH_TOKEN",
 	}
 
-	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(getCorsHandler())
-	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello chi ☕!"))
-	})
+	for _, envVar := range requiredVars {
+		if os.Getenv(envVar) == "" {
+			return fmt.Errorf("%s is not set", envVar)
+		}
+	}
+	return nil
+}
 
-	log.Println("Creating Spotify Client 🔨")
+func checkRefreshTokenValidity(ctx context.Context) error {
+	spotifyClient := client.NewSpotifyClient()
+	_, err := spotifyClient.GetCurrentlyPlaying(ctx)
+	if err != nil {
+		if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401") {
+			return fmt.Errorf("refresh token is invalid or expired")
+		}
+
+		log.Printf("Warning: Error checking token validity: %v", err)
+	}
+	return nil
+}
+
+func runServer() error {
+	if err := assertEnvVariablesExist(); err != nil {
+		return fmt.Errorf("environment validation failed: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := checkRefreshTokenValidity(ctx); err != nil {
+		log.Printf("Error: %v", err)
+		log.Println("Please run 'go run auth/main.go' to get a new refresh token")
+		return err
+	}
+
 	spotifyClient := client.NewSpotifyClient()
 	log.Println("Spotify Client Created! ✅")
 
-	r.Get("/api", apiHandler(spotifyClient))
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Use(internal.SecurityHeaders)
+	r.Use(internal.CORS([]string{"https://ash.xyz"}))
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("This is a little project I'm working on 🎶☕!"))
+	})
 
-	http.ListenAndServe(":8080", r)
+	r.Get("/api", apiHandler(spotifyClient))
+	log.Println("API endpoint created! ✅")
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Starting server on port %s", port)
+	return http.ListenAndServe(":"+port, r)
+}
+
+func local() {
+	if err := godotenv.Load(); err != nil {
+		log.Fatalln("Error loading from .env file")
+	}
+	if err := runServer(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func setFlySecrets() error {
+	secrets := map[string]string{
+		"SPOTIFY_CLIENT_ID":     os.Getenv("SPOTIFY_CLIENT_ID"),
+		"SPOTIFY_CLIENT_SECRET": os.Getenv("SPOTIFY_CLIENT_SECRET"),
+		"SPOTIFY_REFRESH_TOKEN": os.Getenv("SPOTIFY_REFRESH_TOKEN"),
+	}
+
+	var args []string
+	for key, value := range secrets {
+		if value != "" {
+			args = append(args, fmt.Sprintf("%s=%s", key, value))
+		}
+	}
+
+	if len(args) == 0 {
+		return fmt.Errorf("no secrets to set")
+	}
+
+	log.Println("Setting Fly.io secrets...")
+	cmd := exec.Command("fly", append([]string{"secrets", "set"}, args...)...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func deploy() {
+	if err := godotenv.Load(".env"); err != nil {
+		log.Fatalln("Error loading from .env file - make sure .env exists with your Spotify credentials")
+	}
+
+	if err := assertEnvVariablesExist(); err != nil {
+		log.Fatalf("Missing environment variables: %v", err)
+	}
+
+	if err := setFlySecrets(); err != nil {
+		log.Printf("Warning: Failed to set secrets: %v", err)
+		log.Println("You may need to set them manually if this is your first deployment")
+	}
+
+	log.Println("Deploying to Fly.io...")
+	cmd := exec.Command("fly", "deploy")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Fly deployment failed: %v", err)
+	}
+}
+
+func runAuth(isProduction bool) error {
+	cmd := exec.Command("go", "run", "auth/main.go")
+	if isProduction {
+		cmd.Args = append(cmd.Args, "--prod")
+	} else {
+		cmd.Args = append(cmd.Args, "--local")
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func needsAuth(isProduction bool) bool {
+	if isProduction {
+		return os.Getenv("SPOTIFY_REFRESH_TOKEN") == ""
+	}
+
+	if err := godotenv.Load(); err != nil {
+		return true
+	}
+
+	refreshToken := os.Getenv("SPOTIFY_REFRESH_TOKEN")
+	if refreshToken == "" {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	spotifyClient := client.NewSpotifyClient()
+	_, err := spotifyClient.GetCurrentlyPlaying(ctx)
+
+	return err != nil && (strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401"))
+}
+
+func main() {
+	modeFlag := flag.String("mode", "local", "Mode to run in (deploy, local, run)")
+	resetAuthFlag := flag.Bool("reset-auth", false, "Force new authentication flow")
+	flag.Parse()
+
+	switch *modeFlag {
+	case "deploy":
+		isProduction := true
+		if *resetAuthFlag || needsAuth(isProduction) {
+			log.Println("Setting up authentication for production...")
+			if err := runAuth(isProduction); err != nil {
+				log.Fatalf("Auth setup failed: %v", err)
+			}
+		}
+		deploy()
+	case "local":
+		isProduction := false
+		if *resetAuthFlag || needsAuth(isProduction) {
+			log.Println("Setting up authentication for local development...")
+			if err := runAuth(isProduction); err != nil {
+				log.Fatalf("Auth setup failed: %v", err)
+			}
+		}
+		local()
+	case "run":
+		if err := runServer(); err != nil {
+			log.Fatal(err)
+		}
+	default:
+		log.Fatal("Invalid mode")
+	}
 }

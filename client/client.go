@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -61,10 +62,14 @@ func WithRefreshToken(refreshToken string) func(*Options) {
 	}
 }
 
-// Determines limit of tracks, artists and recently played songs to be fetched
 func WithLimit(limit int) func(*Options) {
 	return func(o *Options) {
-		o.Limit = fmt.Sprintf("%d", limit) //TODO: range is 0-50, let's do some validation on this
+		if limit < 1 {
+			limit = 1
+		} else if limit > 50 {
+			limit = 50
+		}
+		o.Limit = fmt.Sprintf("%d", limit)
 	}
 }
 
@@ -172,7 +177,7 @@ func (s *SpotifyClient) GetTopTracks(ctx context.Context) (*TopTracks, error) {
 func (s *SpotifyClient) doRequest(ctx context.Context, url string, params url.Values, result interface{}) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	if params != nil {
@@ -181,7 +186,7 @@ func (s *SpotifyClient) doRequest(ctx context.Context, url string, params url.Va
 
 	r, err := s.client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("request failed: %w", err)
 	}
 	defer r.Body.Close()
 
@@ -189,9 +194,29 @@ func (s *SpotifyClient) doRequest(ctx context.Context, url string, params url.Va
 		return nil
 	}
 
-	err = json.NewDecoder(r.Body).Decode(result)
+	if r.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("unauthorized: invalid or expired token")
+	}
+
+	if r.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("rate limited by Spotify API")
+	}
+
+	if r.StatusCode >= 500 {
+		return fmt.Errorf("spotify server error: %d", r.StatusCode)
+	}
+
+	if r.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", r.StatusCode)
+	}
+
+	// Limit response body size to prevent memory exhaustion
+	const maxResponseSize = 10 << 20 // 10MB
+	limitedReader := &io.LimitedReader{R: r.Body, N: maxResponseSize}
+
+	err = json.NewDecoder(limitedReader).Decode(result)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	return nil
