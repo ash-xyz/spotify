@@ -2,8 +2,6 @@
 .fly/
 
 # Build artifacts
-.dockerignore
-Dockerfile
 .docker/
 
 # Local development
