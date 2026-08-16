@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -24,7 +25,14 @@ const (
 	maxStaleness = 10 * time.Minute
 
 	fetchTimeout = 10 * time.Second
+
+	// How long to leave a failing section alone before trying it again, so a
+	// Spotify outage or a 429 isn't met with a retry on every single request.
+	failureBackoff = 30 * time.Second
 )
+
+// sectionCount is how many sections make up a full response.
+const sectionCount = 4
 
 // section caches the result of one Spotify endpoint. Once warm it never makes a
 // caller wait: stale data is served immediately and refreshed in the background.
@@ -41,6 +49,8 @@ type section[T any] struct {
 	fetchedAt  time.Time
 	cached     bool
 	refreshing bool
+	failedAt   time.Time
+	lastErr    error
 
 	// Held for the duration of a fetch so that concurrent callers on a cold
 	// cache make one request to Spotify between them rather than one each.
@@ -58,7 +68,9 @@ func (s *section[T]) get(ctx context.Context) (T, error) {
 
 	// Refresh behind the caller while what we hold is still worth showing.
 	if cached && (s.maxStale == 0 || age < s.maxStale) {
-		s.refreshInBackground()
+		if !s.inBackoff() {
+			s.refreshInBackground()
+		}
 		return val, nil
 	}
 
@@ -97,6 +109,15 @@ func (s *section[T]) refreshInBackground() {
 	}()
 }
 
+// inBackoff reports whether this section failed recently enough that trying
+// again would just add load to something already struggling.
+func (s *section[T]) inBackoff() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return !s.failedAt.IsZero() && time.Since(s.failedAt) < failureBackoff
+}
+
 func (s *section[T]) refresh(ctx context.Context) (T, error) {
 	s.fetchMu.Lock()
 	defer s.fetchMu.Unlock()
@@ -104,19 +125,32 @@ func (s *section[T]) refresh(ctx context.Context) (T, error) {
 	// Another caller may have refreshed while we waited for the lock.
 	s.mu.Lock()
 	val, cached, age := s.val, s.cached, time.Since(s.fetchedAt)
+	failedAt, lastErr := s.failedAt, s.lastErr
 	s.mu.Unlock()
+
 	if cached && age < s.ttl {
 		return val, nil
 	}
 
+	if !failedAt.IsZero() && time.Since(failedAt) < failureBackoff {
+		var zero T
+		return zero, fmt.Errorf("not retrying %s for another %s: %w",
+			s.name, (failureBackoff - time.Since(failedAt)).Round(time.Second), lastErr)
+	}
+
 	val, err := s.fetch(ctx)
 	if err != nil {
+		s.mu.Lock()
+		s.failedAt, s.lastErr = time.Now(), err
+		s.mu.Unlock()
+
 		var zero T
 		return zero, err
 	}
 
 	s.mu.Lock()
 	s.val, s.fetchedAt, s.cached = val, time.Now(), true
+	s.failedAt, s.lastErr = time.Time{}, nil
 	s.mu.Unlock()
 
 	return val, nil
@@ -153,10 +187,10 @@ func (c *spotifyCache) all(ctx context.Context) (*SpotifyInfo, error) {
 	var (
 		wg           sync.WaitGroup
 		info         SpotifyInfo
-		errorChannel = make(chan error, 4)
+		errorChannel = make(chan error, sectionCount)
 	)
 
-	wg.Add(4)
+	wg.Add(sectionCount)
 
 	go func() {
 		defer wg.Done()
@@ -201,8 +235,18 @@ func (c *spotifyCache) all(ctx context.Context) (*SpotifyInfo, error) {
 	wg.Wait()
 	close(errorChannel)
 
+	var errs []error
 	for err := range errorChannel {
-		return nil, err
+		errs = append(errs, err)
+		log.Printf("Error building response: %v", err)
+	}
+
+	// Serve whatever came back. One endpoint failing shouldn't blank out the
+	// other three, and the response models every section as nullable already.
+	// Only a total failure is worth reporting as one, since that means
+	// something systemic like a dead token rather than one flaky endpoint.
+	if len(errs) == sectionCount {
+		return nil, errors.Join(errs...)
 	}
 
 	return &info, nil
