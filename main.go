@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ash-xyz/spotify/client"
@@ -83,6 +85,9 @@ func writeJSON(w http.ResponseWriter, v any, cacheControl string) {
 // How long to wait for someone to finish authorizing in the browser.
 const authTimeout = 5 * time.Minute
 
+// How long in-flight requests get to finish once a shutdown starts.
+const shutdownTimeout = 5 * time.Second
+
 // setupHelp is what a first run on a new machine needs to know, which is when
 // these values are most likely to be missing. Step 2 is the one that bites:
 // Spotify matches the redirect URI as an exact string.
@@ -146,7 +151,7 @@ func runServer() error {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(internal.SecurityHeaders)
-	r.Use(internal.CORS([]string{"https://ash.xyz", "https://www.ash.xyz"}))
+	r.Use(internal.CORS(allowedOrigins()))
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("This is a little project I'm working on 🎶☕!"))
@@ -172,7 +177,47 @@ func runServer() error {
 
 	go warmCache(cache)
 
-	return http.Serve(listener, r)
+	return serve(&http.Server{Handler: r}, listener)
+}
+
+// allowedOrigins is the site, plus anything listed in ALLOWED_ORIGINS. That's
+// how you point a locally served copy of the site at this API, which is
+// otherwise impossible without editing the allowlist.
+func allowedOrigins() []string {
+	origins := []string{"https://ash.xyz", "https://www.ash.xyz"}
+
+	for _, origin := range strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+
+	return origins
+}
+
+// serve runs the server until it fails or the machine is asked to stop. Fly
+// sends SIGINT every time it stops or suspends a machine, which with
+// auto_stop_machines is a routine event rather than a rare one, so responses
+// in flight are given a moment to finish instead of being cut off.
+func serve(server *http.Server, listener net.Listener) error {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- server.Serve(listener) }()
+
+	select {
+	case err := <-serverErr:
+		return err
+	case sig := <-stop:
+		log.Printf("Got %s, finishing in-flight requests...", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		return server.Shutdown(ctx)
+	}
 }
 
 func setFlySecrets() error {
@@ -182,19 +227,22 @@ func setFlySecrets() error {
 		"SPOTIFY_REFRESH_TOKEN": os.Getenv("SPOTIFY_REFRESH_TOKEN"),
 	}
 
-	var args []string
+	var lines []string
 	for key, value := range secrets {
 		if value != "" {
-			args = append(args, fmt.Sprintf("%s=%s", key, value))
+			lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 		}
 	}
 
-	if len(args) == 0 {
+	if len(lines) == 0 {
 		return fmt.Errorf("no secrets to set")
 	}
 
 	log.Println("Setting Fly.io secrets...")
-	cmd := exec.Command("fly", append([]string{"secrets", "set"}, args...)...)
+	// Piped in rather than passed as arguments, which any other process on the
+	// machine could read out of the process list while this runs.
+	cmd := exec.Command("fly", "secrets", "import")
+	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -289,7 +337,14 @@ func needsAuth() bool {
 func writeToEnvFile(refreshToken string) error {
 	envContent := fmt.Sprintf("SPOTIFY_REFRESH_TOKEN=%s\n", refreshToken)
 
-	if existingContent, err := os.ReadFile(".env"); err == nil {
+	existingContent, err := os.ReadFile(".env")
+	if err != nil && !os.IsNotExist(err) {
+		// Carrying on here would replace a .env we couldn't read with one
+		// holding only the refresh token, throwing away the client credentials.
+		return fmt.Errorf("couldn't read .env to update it: %w", err)
+	}
+
+	if err == nil {
 		lines := strings.Split(string(existingContent), "\n")
 		var newLines []string
 		found := false
@@ -310,7 +365,7 @@ func writeToEnvFile(refreshToken string) error {
 		envContent = strings.Join(newLines, "\n")
 	}
 
-	return os.WriteFile(".env", []byte(envContent), 0644)
+	return os.WriteFile(".env", []byte(envContent), 0600)
 }
 
 func main() {
