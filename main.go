@@ -6,11 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ash-xyz/spotify/client"
@@ -27,115 +27,56 @@ type SpotifyInfo struct {
 	RecentlyPlayed   *client.RecentlyPlayedTracks `json:"recently_played"`
 }
 
-var (
-	cache      []byte
-	cacheMutex sync.Mutex
-	cacheTime  time.Time
-)
-
-func getSpotifyDataAsJSON(client *client.SpotifyClient, ctx context.Context) ([]byte, error) {
-	cacheMutex.Lock()
-
-	if cache != nil && time.Since(cacheTime) < 3*time.Minute {
-		result := make([]byte, len(cache))
-		copy(result, cache)
-		cacheMutex.Unlock()
-		return result, nil
-	}
-
-	cacheMutex.Unlock()
-
-	var wg sync.WaitGroup
-
-	spotifyInfo := SpotifyInfo{}
-	wg.Add(4)
-
-	errorChannel := make(chan error, 4)
-
-	go func() {
-		defer wg.Done()
-		currentlyPlaying, err := client.GetCurrentlyPlaying(ctx)
-		if err != nil {
-			spotifyInfo.CurrentlyPlaying = nil
-			log.Printf("Error fetching currently playing: %v", err)
-			errorChannel <- fmt.Errorf("failed to fetch currently playing: %w", err)
-		} else {
-			spotifyInfo.CurrentlyPlaying = currentlyPlaying
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		topArtists, err := client.GetTopArtists(ctx)
-		if err != nil {
-			spotifyInfo.TopArtists = nil
-			log.Printf("Error fetching top artists: %v", err)
-			errorChannel <- fmt.Errorf("failed to fetch top artists: %w", err)
-		} else {
-			spotifyInfo.TopArtists = topArtists
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		topTracks, err := client.GetTopTracks(ctx)
-		if err != nil {
-			spotifyInfo.TopSongs = nil
-			log.Printf("Error fetching top tracks: %v", err)
-			errorChannel <- fmt.Errorf("failed to fetch top tracks: %w", err)
-		} else {
-			spotifyInfo.TopSongs = topTracks
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		recentlyPlayed, err := client.GetRecentlyPlayed(ctx)
-		if err != nil {
-			spotifyInfo.RecentlyPlayed = nil
-			log.Printf("Error fetching recently played: %v", err)
-			errorChannel <- fmt.Errorf("failed to fetch recently played: %w", err)
-		} else {
-			spotifyInfo.RecentlyPlayed = recentlyPlayed
-		}
-	}()
-
-	wg.Wait()
-	close(errorChannel)
-
-	for err := range errorChannel {
-		return nil, err
-	}
-
-	jsonData, err := json.MarshalIndent(spotifyInfo, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-
-	cacheMutex.Lock()
-
-	cache = make([]byte, len(jsonData))
-	copy(cache, jsonData)
-	cacheTime = time.Now()
-
-	cacheMutex.Unlock()
-
-	return jsonData, nil
-}
-
-func apiHandler(client *client.SpotifyClient) http.HandlerFunc {
+func apiHandler(cache *spotifyCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		data, err := getSpotifyDataAsJSON(client, context.Background())
-
+		info, err := cache.all(r.Context())
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("Error retrieving data"))
+			log.Printf("Error retrieving data: %v", err)
+			http.Error(w, "Error retrieving data", http.StatusInternalServerError)
 			return
 		}
 
-		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		// Capped at the shortest section TTL, since the response carries
+		// currently playing alongside much slower moving data.
+		writeJSON(w, info, fmt.Sprintf("public, max-age=%d", int(currentlyPlayingTTL.Seconds())))
 	}
+}
+
+// nowPlayingHandler serves just the currently playing track, so a page polling
+// for live playback doesn't refetch the top charts every few seconds.
+func nowPlayingHandler(cache *spotifyCache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		currentlyPlaying, err := cache.currentlyPlaying.get(r.Context())
+		if err != nil {
+			log.Printf("Error retrieving currently playing: %v", err)
+			http.Error(w, "Error retrieving data", http.StatusInternalServerError)
+			return
+		}
+
+		// This endpoint exists to be polled tightly, so let every poll through
+		// rather than having the browser damp it to the cache lifetime. The
+		// server answers from its own cache in well under a millisecond.
+		writeJSON(w, currentlyPlaying, "no-cache")
+	}
+}
+
+// writeJSON writes v as JSON under the given Cache-Control policy.
+//
+// Deliberately no stale-while-revalidate: a poller would then render the
+// previous response while revalidating, putting the page a full poll interval
+// behind.
+func writeJSON(w http.ResponseWriter, v any, cacheControl string) {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		log.Printf("Error encoding response: %v", err)
+		http.Error(w, "Error encoding response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", cacheControl)
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
 }
 
 func assertEnvVariablesExist() error {
@@ -153,17 +94,23 @@ func assertEnvVariablesExist() error {
 	return nil
 }
 
-func checkRefreshTokenValidity(ctx context.Context) error {
-	spotifyClient := client.NewSpotifyClient()
-	_, err := spotifyClient.GetCurrentlyPlaying(ctx)
-	if err != nil {
-		if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401") {
-			return fmt.Errorf("refresh token is invalid or expired")
-		}
+// warmCache primes every section so the first visitor after a cold start is
+// served from cache instead of waiting on Spotify. It doubles as the refresh
+// token check, since a bad token surfaces here as an unauthorized error.
+func warmCache(cache *spotifyCache) {
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+	defer cancel()
 
-		log.Printf("Warning: Error checking token validity: %v", err)
+	if _, err := cache.all(ctx); err != nil {
+		log.Printf("Warning: failed to warm cache: %v", err)
+		if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401") {
+			log.Println("Refresh token is invalid or expired")
+			log.Println("Please run 'go run . --mode local --reset-auth' to get a new refresh token")
+		}
+		return
 	}
-	return nil
+
+	log.Println("Cache warmed! ✅")
 }
 
 func runServer() error {
@@ -171,16 +118,8 @@ func runServer() error {
 		return fmt.Errorf("environment validation failed: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := checkRefreshTokenValidity(ctx); err != nil {
-		log.Printf("Error: %v", err)
-		log.Println("Please run 'go run auth/main.go' to get a new refresh token")
-		return err
-	}
-
 	spotifyClient := client.NewSpotifyClient()
+	cache := newSpotifyCache(spotifyClient)
 	log.Println("Spotify Client Created! ✅")
 
 	r := chi.NewRouter()
@@ -192,16 +131,27 @@ func runServer() error {
 		w.Write([]byte("This is a little project I'm working on 🎶☕!"))
 	})
 
-	r.Get("/api", apiHandler(spotifyClient))
-	log.Println("API endpoint created! ✅")
+	r.Get("/api", apiHandler(cache))
+	r.Get("/api/now-playing", nowPlayingHandler(cache))
+	log.Println("API endpoints created! ✅")
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
+	// Open the socket before touching Spotify. Fly holds the visitor's
+	// connection until this port accepts, so any network call made first is
+	// added directly to the cold start they see.
+	listener, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		return fmt.Errorf("failed to listen on port %s: %w", port, err)
+	}
 	log.Printf("Starting server on port %s", port)
-	return http.ListenAndServe(":"+port, r)
+
+	go warmCache(cache)
+
+	return http.Serve(listener, r)
 }
 
 func local() {
@@ -274,11 +224,9 @@ func runAuth(isProduction bool) error {
 }
 
 func needsAuth(isProduction bool) bool {
-	if isProduction {
-		return os.Getenv("SPOTIFY_REFRESH_TOKEN") == ""
-	}
-
-	if err := godotenv.Load(); err != nil {
+	// Both modes run from a dev machine, where .env holds the token; in prod
+	// mode a missing .env is fine, since the values may come from the shell.
+	if err := godotenv.Load(); err != nil && !isProduction {
 		return true
 	}
 

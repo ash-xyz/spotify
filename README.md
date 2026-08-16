@@ -25,7 +25,7 @@ go run main.go --mode local
 
 ## API
 
-**GET /api** - Returns your Spotify data (cached for 3 minutes)
+**GET /api** - Returns all your Spotify data
 
 ```json
 {
@@ -35,6 +35,18 @@ go run main.go --mode local
   "recently_played": {"tracks": [...]}
 }
 ```
+
+**GET /api/now-playing** - Just the current track, for polling live playback
+without refetching everything else. `null` when nothing is playing.
+
+```json
+{"track": {"name": "Track Name", "artists": [...]}, "progress_ms": 12345}
+```
+
+Each kind of data is cached for as long as it stays useful — 5s for currently
+playing, 1 minute for recently played, 30 minutes for the top charts. Once warm,
+stale data is served immediately and refreshed in the background, so requests
+don't wait on Spotify.
 
 ## Deployment
 
