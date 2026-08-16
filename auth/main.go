@@ -19,7 +19,9 @@ import (
 	"golang.org/x/oauth2/spotify"
 )
 
-const redirectURI = "http://localhost:8888/callback"
+// Spotify requires loopback redirects to use the explicit IP 127.0.0.1;
+// the "localhost" hostname is rejected as insecure.
+const redirectURI = "http://127.0.0.1:8888/callback"
 
 var scopes = []string{
 	"user-read-currently-playing",
@@ -107,13 +109,15 @@ func completeAuth(auth *oauth2.Config, state string, isProduction bool) func(w h
 			} else {
 				fmt.Println("✅ Production secrets updated successfully!")
 			}
+		}
+
+		// Always persist locally too: this process cannot mutate the
+		// parent's environment, so deploy re-reads .env for the token.
+		if err := writeToEnvFile(token.RefreshToken); err != nil {
+			log.Printf("Failed to write to .env file: %v", err)
+			fmt.Printf("Please manually add to .env: SPOTIFY_REFRESH_TOKEN=%s\n", token.RefreshToken)
 		} else {
-			if err := writeToEnvFile(token.RefreshToken); err != nil {
-				log.Printf("Failed to write to .env file: %v", err)
-				fmt.Printf("Please manually add to .env: SPOTIFY_REFRESH_TOKEN=%s\n", token.RefreshToken)
-			} else {
-				fmt.Println("✅ Local .env file updated successfully!")
-			}
+			fmt.Println("✅ Local .env file updated successfully!")
 		}
 
 		go func() {
