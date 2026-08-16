@@ -5,23 +5,30 @@ A simple Go web service that fetches and caches your personal Spotify data (top 
 ## Prerequisites
 
 - Go 1.24+
-- [Spotify Developer App](https://developer.spotify.com/dashboard) with these scopes:
-  - `user-read-currently-playing`
-  - `user-top-read`
-  - `user-read-recently-played`
+- A [Spotify app](https://developer.spotify.com/dashboard)
+- [flyctl](https://fly.io/docs/flyctl/install/) and `fly auth login`, for deploying only
 
 ## Quick Start
 
-```bash
-# Clone and setup
-...
-# Create .env with your Spotify app credentials
-echo "SPOTIFY_CLIENT_ID=your_client_id" > .env
-echo "SPOTIFY_CLIENT_SECRET=your_client_secret" >> .env
+Create a Spotify app, then **add `http://127.0.0.1:8888/callback` to it as a
+Redirect URI**. Spotify compares this as an exact string, so anything else —
+`localhost` instead of `127.0.0.1`, a stray slash — fails the login with
+`redirect_uri: Not matching configuration`.
 
-# Run (automatically handles Spotify OAuth)
-go run main.go --mode local
+```bash
+git clone https://github.com/ash-xyz/spotify.git
+cd spotify
+
+cp .env.example .env
+# Fill in SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET from your app
+
+# Opens a browser to authorize, saves the refresh token to .env, and serves
+# on http://localhost:8080
+go run . --mode local
 ```
+
+The app requests these scopes, which you approve in that browser step:
+`user-read-currently-playing`, `user-top-read`, `user-read-recently-played`.
 
 ## API
 
@@ -50,9 +57,18 @@ don't wait on Spotify.
 
 ## Deployment
 
+Pushing to `main` deploys via GitHub Actions, once the build, vet, tests and
+`docker build` all pass. That needs a `FLY_API_TOKEN` repository secret:
+
 ```bash
-# Deploy to Fly.io (automatically handles auth + secrets)
-go run main.go --mode deploy
+fly tokens create deploy -x 8760h | gh secret set FLY_API_TOKEN --repo ash-xyz/spotify
+```
+
+To deploy from your own machine instead — which also pushes your local
+credentials up as Fly secrets, and is how a first deploy gets bootstrapped:
+
+```bash
+go run . --mode deploy
 ```
 
 ## Environment Variables
@@ -61,10 +77,13 @@ go run main.go --mode deploy
 |----------|-------------|----------|
 | `SPOTIFY_CLIENT_ID` | Your Spotify app client ID | ✅ |
 | `SPOTIFY_CLIENT_SECRET` | Your Spotify app client secret | ✅ |
-| `SPOTIFY_REFRESH_TOKEN` | Auto-generated during auth flow | Auto |
+| `SPOTIFY_REFRESH_TOKEN` | Fetched by the auth flow and written to `.env` | Auto |
+| `SPOTIFY_REDIRECT_URI` | Overrides the callback, if your app registers a different one | Optional |
+| `PORT` | Port to serve on (default `8080`) | Optional |
 
 ## Commands
 
-- `go run main.go --mode local` - Run locally
-- `go run main.go --mode deploy` - Deploy to production
-- `go run main.go --mode local --reset-auth` - Force re-authentication
+- `go run . --mode local` - Run locally, authorizing first if needed
+- `go run . --mode run` - Run the server only, reading config from the environment
+- `go run . --mode deploy` - Deploy to production
+- `go run . --mode local --reset-auth` - Force re-authentication
