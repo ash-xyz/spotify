@@ -15,6 +15,7 @@ import (
 
 	"github.com/ash-xyz/spotify/client"
 	"github.com/ash-xyz/spotify/internal"
+	"github.com/ash-xyz/spotify/internal/auth"
 	chi "github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
@@ -79,6 +80,20 @@ func writeJSON(w http.ResponseWriter, v any, cacheControl string) {
 	w.Write(data)
 }
 
+// How long to wait for someone to finish authorizing in the browser.
+const authTimeout = 5 * time.Minute
+
+// setupHelp is what a first run on a new machine needs to know, which is when
+// these values are most likely to be missing. Step 2 is the one that bites:
+// Spotify matches the redirect URI as an exact string.
+var setupHelp = fmt.Sprintf(`To set up:
+  1. Create an app at https://developer.spotify.com/dashboard
+  2. Add %s as a Redirect URI on it. This has to
+     match exactly, or authorization fails with "redirect_uri: Not matching
+     configuration". Override it with SPOTIFY_REDIRECT_URI if you need to.
+  3. cp .env.example .env, then fill in the client ID and secret from step 1.
+  4. go run . --mode local, which fetches the refresh token for you.`, auth.DefaultRedirectURI)
+
 func assertEnvVariablesExist() error {
 	requiredVars := []string{
 		"SPOTIFY_CLIENT_ID",
@@ -86,12 +101,18 @@ func assertEnvVariablesExist() error {
 		"SPOTIFY_REFRESH_TOKEN",
 	}
 
+	var missing []string
 	for _, envVar := range requiredVars {
 		if os.Getenv(envVar) == "" {
-			return fmt.Errorf("%s is not set", envVar)
+			missing = append(missing, envVar)
 		}
 	}
-	return nil
+
+	if len(missing) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("not set: %s\n\n%s", strings.Join(missing, ", "), setupHelp)
 }
 
 // warmCache primes every section so the first visitor after a cold start is
@@ -105,7 +126,7 @@ func warmCache(cache *spotifyCache) {
 		log.Printf("Warning: failed to warm cache: %v", err)
 		if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401") {
 			log.Println("Refresh token is invalid or expired")
-			log.Println("Please run 'go run . --mode local --reset-auth' to get a new refresh token")
+			log.Println("Please run 'go run . --mode local --reset-auth' to get a new one")
 		}
 		return
 	}
@@ -154,15 +175,6 @@ func runServer() error {
 	return http.Serve(listener, r)
 }
 
-func local() {
-	if err := godotenv.Load(); err != nil {
-		log.Fatalln("Error loading from .env file")
-	}
-	if err := runServer(); err != nil {
-		log.Fatal(err)
-	}
-}
-
 func setFlySecrets() error {
 	secrets := map[string]string{
 		"SPOTIFY_CLIENT_ID":     os.Getenv("SPOTIFY_CLIENT_ID"),
@@ -189,12 +201,8 @@ func setFlySecrets() error {
 }
 
 func deploy() {
-	if err := godotenv.Load(".env"); err != nil {
-		log.Fatalln("Error loading from .env file - make sure .env exists with your Spotify credentials")
-	}
-
 	if err := assertEnvVariablesExist(); err != nil {
-		log.Fatalf("Missing environment variables: %v", err)
+		log.Fatal(err)
 	}
 
 	if err := setFlySecrets(); err != nil {
@@ -211,37 +219,98 @@ func deploy() {
 	}
 }
 
-func runAuth(isProduction bool) error {
-	cmd := exec.Command("go", "run", "auth/main.go")
-	if isProduction {
-		cmd.Args = append(cmd.Args, "--prod")
-	} else {
-		cmd.Args = append(cmd.Args, "--local")
+// loadEnvFile pulls in .env if there is one. A missing file isn't fatal by
+// itself, since the values can come from the shell instead; what matters is
+// whether the credentials end up set, which assertEnvVariablesExist reports
+// with something actionable to say.
+func loadEnvFile() {
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: couldn't read .env: %v", err)
 	}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }
 
-func needsAuth(isProduction bool) bool {
-	// Both modes run from a dev machine, where .env holds the token; in prod
-	// mode a missing .env is fine, since the values may come from the shell.
-	if err := godotenv.Load(); err != nil && !isProduction {
+// ensureAuth gets a refresh token if there isn't a working one already, and
+// persists it. Running the flow in process rather than shelling out means the
+// token is available to the rest of this run immediately.
+func ensureAuth(isProduction, reset bool) error {
+	if !reset && !needsAuth() {
+		return nil
+	}
+
+	id, secret := os.Getenv("SPOTIFY_CLIENT_ID"), os.Getenv("SPOTIFY_CLIENT_SECRET")
+	if id == "" || secret == "" {
+		return fmt.Errorf("missing SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET\n\n%s", setupHelp)
+	}
+
+	if isProduction {
+		log.Println("Setting up authentication for production...")
+	} else {
+		log.Println("Setting up authentication for local development...")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
+	defer cancel()
+
+	refreshToken, err := auth.Run(ctx, id, secret)
+	if err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+
+	// The flow ran in this process, so the rest of this run can just use it.
+	os.Setenv("SPOTIFY_REFRESH_TOKEN", refreshToken)
+
+	if err := writeToEnvFile(refreshToken); err != nil {
+		log.Printf("Failed to write to .env file: %v", err)
+		fmt.Printf("Please manually add to .env: SPOTIFY_REFRESH_TOKEN=%s\n", refreshToken)
+	} else {
+		log.Println("Local .env file updated! ✅")
+	}
+
+	return nil
+}
+
+// needsAuth reports whether the stored refresh token is missing or rejected.
+func needsAuth() bool {
+	if os.Getenv("SPOTIFY_REFRESH_TOKEN") == "" {
 		return true
 	}
 
-	refreshToken := os.Getenv("SPOTIFY_REFRESH_TOKEN")
-	if refreshToken == "" {
-		return true
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 
 	spotifyClient := client.NewSpotifyClient()
 	_, err := spotifyClient.GetCurrentlyPlaying(ctx)
 
 	return err != nil && (strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401"))
+}
+
+// writeToEnvFile stores the refresh token in .env, leaving any other values in
+// the file alone.
+func writeToEnvFile(refreshToken string) error {
+	envContent := fmt.Sprintf("SPOTIFY_REFRESH_TOKEN=%s\n", refreshToken)
+
+	if existingContent, err := os.ReadFile(".env"); err == nil {
+		lines := strings.Split(string(existingContent), "\n")
+		var newLines []string
+		found := false
+
+		for _, line := range lines {
+			if strings.HasPrefix(line, "SPOTIFY_REFRESH_TOKEN=") {
+				newLines = append(newLines, fmt.Sprintf("SPOTIFY_REFRESH_TOKEN=%s", refreshToken))
+				found = true
+			} else {
+				newLines = append(newLines, line)
+			}
+		}
+
+		if !found {
+			newLines = append(newLines, fmt.Sprintf("SPOTIFY_REFRESH_TOKEN=%s", refreshToken))
+		}
+
+		envContent = strings.Join(newLines, "\n")
+	}
+
+	return os.WriteFile(".env", []byte(envContent), 0644)
 }
 
 func main() {
@@ -251,28 +320,24 @@ func main() {
 
 	switch *modeFlag {
 	case "deploy":
-		isProduction := true
-		if *resetAuthFlag || needsAuth(isProduction) {
-			log.Println("Setting up authentication for production...")
-			if err := runAuth(isProduction); err != nil {
-				log.Fatalf("Auth setup failed: %v", err)
-			}
+		loadEnvFile()
+		if err := ensureAuth(true, *resetAuthFlag); err != nil {
+			log.Fatal(err)
 		}
 		deploy()
 	case "local":
-		isProduction := false
-		if *resetAuthFlag || needsAuth(isProduction) {
-			log.Println("Setting up authentication for local development...")
-			if err := runAuth(isProduction); err != nil {
-				log.Fatalf("Auth setup failed: %v", err)
-			}
+		loadEnvFile()
+		if err := ensureAuth(false, *resetAuthFlag); err != nil {
+			log.Fatal(err)
 		}
-		local()
+		if err := runServer(); err != nil {
+			log.Fatal(err)
+		}
 	case "run":
 		if err := runServer(); err != nil {
 			log.Fatal(err)
 		}
 	default:
-		log.Fatal("Invalid mode")
+		log.Fatalf("Invalid mode %q: expected deploy, local, or run", *modeFlag)
 	}
 }
