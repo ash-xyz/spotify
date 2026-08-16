@@ -114,11 +114,9 @@ func NewSpotifyClient(opts ...func(*Options)) *SpotifyClient {
 
 func (s *SpotifyClient) GetCurrentlyPlaying(ctx context.Context) (*CurrentlyPlaying, error) {
 	cp := &SpotifyCurrentlyPlaying{}
-	params := url.Values{
-		"limit": {s.options.Limit},
-	}
 
-	err := s.doRequest(ctx, currentlyPlaying, params, cp)
+	// No limit here: this endpoint returns a single track, not a list.
+	err := s.doRequest(ctx, currentlyPlaying, nil, cp)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +125,12 @@ func (s *SpotifyClient) GetCurrentlyPlaying(ctx context.Context) (*CurrentlyPlay
 		return nil, nil
 	}
 
-	return cp.Convert(), nil
+	converted := cp.Convert()
+	// Stamped here rather than in Convert so that conversion stays a pure
+	// function of the response.
+	converted.FetchedAtMs = time.Now().UnixMilli()
+
+	return converted, nil
 }
 
 func (s *SpotifyClient) GetRecentlyPlayed(ctx context.Context) (*RecentlyPlayedTracks, error) {

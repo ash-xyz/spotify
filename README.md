@@ -47,8 +47,18 @@ The app requests these scopes, which you approve in that browser step:
 without refetching everything else. `null` when nothing is playing.
 
 ```json
-{"track": {"name": "Track Name", "artists": [...]}, "progress_ms": 12345}
+{
+  "track": {"name": "Track Name", "artists": [...], "duration_ms": 215306},
+  "progress_ms": 112865,
+  "is_playing": true,
+  "fetched_at_ms": 1786920367458
+}
 ```
+
+`is_playing` is false while paused — Spotify keeps returning the track either
+way, so without checking it a paused track reads as still playing. Adding the
+time elapsed since `fetched_at_ms` to `progress_ms` tracks playback smoothly
+between polls, rather than stepping each time you poll.
 
 Each kind of data is cached for as long as it stays useful — 5s for currently
 playing, 1 minute for recently played, 30 minutes for the top charts. Once warm,

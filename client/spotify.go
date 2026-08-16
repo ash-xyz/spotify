@@ -7,6 +7,7 @@ type SpotifyTrack struct {
 	Name         string            `json:"name"`
 	Artists      []*SpotifyArtist  `json:"artists"`
 	ExternalURLs map[string]string `json:"external_urls"`
+	DurationMs   int               `json:"duration_ms"`
 }
 
 type SpotifyArtist struct {
@@ -17,6 +18,9 @@ type SpotifyArtist struct {
 type SpotifyCurrentlyPlaying struct {
 	Progress int           `json:"progress_ms"`
 	Item     *SpotifyTrack `json:"item"`
+	// IsPlaying is false while paused. The track stays in the response either
+	// way, so without this a paused track looks like it's still playing.
+	IsPlaying bool `json:"is_playing"`
 }
 
 type SpotifyRecentlyPlayed struct {

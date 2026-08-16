@@ -5,6 +5,7 @@ type Track struct {
 	Name       string    `json:"name"`
 	Artists    []*Artist `json:"artists"`
 	SpotifyUrl *string   `json:"spotify_url"`
+	DurationMs int       `json:"duration_ms,omitempty"`
 }
 
 type Artist struct {
@@ -15,6 +16,12 @@ type Artist struct {
 type CurrentlyPlaying struct {
 	Progress int    `json:"progress_ms"`
 	Track    *Track `json:"track"`
+	// IsPlaying distinguishes listening from paused.
+	IsPlaying bool `json:"is_playing"`
+	// FetchedAtMs is when Progress was read, as Unix milliseconds. A consumer
+	// polling every few seconds can add the elapsed time to Progress to track
+	// playback smoothly, instead of stepping whenever it happens to poll.
+	FetchedAtMs int64 `json:"fetched_at_ms,omitempty"`
 }
 
 type RecentlyPlayedTracks struct {
@@ -61,8 +68,9 @@ func (c *SpotifyCurrentlyPlaying) Convert() *CurrentlyPlaying {
 		return nil
 	}
 	return &CurrentlyPlaying{
-		Progress: c.Progress,
-		Track:    c.Item.convert(),
+		Progress:  c.Progress,
+		Track:     c.Item.convert(),
+		IsPlaying: c.IsPlaying,
 	}
 }
 
@@ -130,6 +138,7 @@ func (s *SpotifyTrack) convert() *Track {
 		Name:       s.Name,
 		Artists:    convertArtists(s.Artists),
 		SpotifyUrl: &url,
+		DurationMs: s.DurationMs,
 	}
 }
 
