@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"time"
 
 	"github.com/pkg/browser"
 	"golang.org/x/oauth2"
@@ -73,18 +74,29 @@ func Run(ctx context.Context, clientID, clientSecret string) (string, error) {
 		return "", fmt.Errorf("failed to generate state (csrf) token: %w", err)
 	}
 
+	// Bound to the redirect's own host rather than every interface. The
+	// default is loopback, so on a shared network nobody else can reach the
+	// callback during the window it's open.
+	address := net.JoinHostPort(redirect.Hostname(), port)
+
 	// Listen before opening the browser so that a quick authorization can't
 	// redirect back before anything is there to answer it.
-	listener, err := net.Listen("tcp", ":"+port)
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		return "", fmt.Errorf("failed to listen on port %s for the callback: %w", port, err)
+		return "", fmt.Errorf("failed to listen on %s for the callback: %w", address, err)
 	}
 	defer listener.Close()
 
 	results := make(chan result, 1)
 	mux := http.NewServeMux()
 	mux.HandleFunc(redirect.Path, completeAuth(cfg, state, results))
-	server := &http.Server{Handler: mux}
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
 	go server.Serve(listener)
 	defer server.Shutdown(context.Background())
 

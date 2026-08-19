@@ -177,7 +177,22 @@ func runServer() error {
 
 	go warmCache(cache)
 
-	return serve(&http.Server{Handler: r}, listener)
+	return serve(newServer(r), listener)
+}
+
+// newServer applies timeouts, because Go's defaults are "wait forever": a
+// handful of connections that dribble out a request can otherwise hold
+// goroutines and file descriptors open indefinitely, and keep the machine
+// awake while they do it. WriteTimeout has to clear fetchTimeout, so that a
+// request arriving on a cold cache still gets a response.
+func newServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      fetchTimeout + 20*time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 }
 
 // allowedOrigins is the site, plus anything listed in ALLOWED_ORIGINS. That's
