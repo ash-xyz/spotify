@@ -27,6 +27,28 @@ type SpotifyClient struct {
 	options *Options
 }
 
+// StatusError is a Spotify response that couldn't be used. What to do about
+// one depends on which it is — a 401 means the authorization is gone and has
+// to be granted again, a 429 means come back later — so the status travels
+// with the error instead of being flattened into its message for a caller to
+// match on.
+type StatusError struct {
+	StatusCode int
+}
+
+func (e *StatusError) Error() string {
+	switch {
+	case e.StatusCode == http.StatusUnauthorized:
+		return "unauthorized: invalid or expired token"
+	case e.StatusCode == http.StatusTooManyRequests:
+		return "rate limited by Spotify API"
+	case e.StatusCode >= 500:
+		return fmt.Sprintf("spotify server error: %d", e.StatusCode)
+	default:
+		return fmt.Sprintf("unexpected status code: %d", e.StatusCode)
+	}
+}
+
 type Options struct {
 	ClientID     string
 	ClientSecret string
@@ -98,16 +120,14 @@ func NewSpotifyClient(opts ...func(*Options)) *SpotifyClient {
 		Endpoint:     spotify.Endpoint,
 	}
 
-	token := &oauth2.Token{
-		RefreshToken: options.RefreshToken,
-	}
-
-	ctx := context.Background()
-	client := cfg.Client(ctx, token)
-	client.Timeout = 10 * time.Second
-
 	return &SpotifyClient{
-		client:  client,
+		client: &http.Client{
+			Transport: &authTransport{
+				source: newTokenSource(cfg, options.RefreshToken, tokenTimeout),
+				base:   http.DefaultTransport,
+			},
+			Timeout: requestTimeout,
+		},
 		options: options,
 	}
 }
@@ -197,20 +217,8 @@ func (s *SpotifyClient) doRequest(ctx context.Context, url string, params url.Va
 		return nil
 	}
 
-	if r.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("unauthorized: invalid or expired token")
-	}
-
-	if r.StatusCode == http.StatusTooManyRequests {
-		return fmt.Errorf("rate limited by Spotify API")
-	}
-
-	if r.StatusCode >= 500 {
-		return fmt.Errorf("spotify server error: %d", r.StatusCode)
-	}
-
 	if r.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", r.StatusCode)
+		return &StatusError{StatusCode: r.StatusCode}
 	}
 
 	// Limit response body size to prevent memory exhaustion

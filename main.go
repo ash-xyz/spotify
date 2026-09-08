@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +24,7 @@ import (
 	chi "github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
+	"golang.org/x/oauth2"
 )
 
 type SpotifyInfo struct {
@@ -121,22 +125,83 @@ func assertEnvVariablesExist() error {
 }
 
 // warmCache primes every section so the first visitor after a cold start is
-// served from cache instead of waiting on Spotify. It doubles as the refresh
-// token check, since a bad token surfaces here as an unauthorized error.
+// served from cache instead of waiting on Spotify. It doubles as the credential
+// check, since credentials Spotify won't accept surface here first.
 func warmCache(cache *spotifyCache) {
 	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 
 	if _, err := cache.all(ctx); err != nil {
 		log.Printf("Warning: failed to warm cache: %v", err)
-		if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401") {
-			log.Println("Refresh token is invalid or expired")
+
+		switch classifyCredentials(err) {
+		case credentialsRejected:
+			log.Println("Spotify has rejected the refresh token, so it can't be renewed")
 			log.Println("Please run 'go run . --mode local --reset-auth' to get a new one")
+		case credentialsMisconfigured:
+			log.Println("Spotify rejected the client ID and secret, so check them against the app in the dashboard")
 		}
 		return
 	}
 
 	log.Println("Cache warmed! ✅")
+}
+
+// credentialState is what a call to Spotify was able to tell us about the
+// credentials in hand.
+type credentialState int
+
+const (
+	// credentialsWorking: Spotify accepted them.
+	credentialsWorking credentialState = iota
+	// credentialsRejected: the refresh grant is gone — revoked, or the app's
+	// secret was rotated out from under it. Only a new authorization fixes it.
+	credentialsRejected
+	// credentialsMisconfigured: the client ID or secret is wrong, which no
+	// amount of reauthorizing will fix.
+	credentialsMisconfigured
+	// credentialsUnknown: the call didn't get far enough to say. Spotify being
+	// unreachable, rate limiting us, or the caller giving up says nothing about
+	// whether the credentials are any good.
+	credentialsUnknown
+)
+
+// classifyCredentials reads an error from a Spotify call for what it says about
+// the stored credentials. It works on the structure of the error rather than
+// its text: the token endpoint reports a revoked grant as invalid_grant, which
+// no amount of looking for "unauthorized" or "401" in a message will find.
+func classifyCredentials(err error) credentialState {
+	if err == nil {
+		return credentialsWorking
+	}
+
+	// Nothing was actually learned about the credentials if we stopped waiting.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return credentialsUnknown
+	}
+
+	var retrieveErr *oauth2.RetrieveError
+	if errors.As(err, &retrieveErr) {
+		switch retrieveErr.ErrorCode {
+		case "invalid_grant":
+			return credentialsRejected
+		case "invalid_client", "unauthorized_client":
+			return credentialsMisconfigured
+		default:
+			// A 5xx or an unrecognised body from the token endpoint is Spotify
+			// having a bad day, not a verdict on the refresh token.
+			return credentialsUnknown
+		}
+	}
+
+	// The API itself rejecting a freshly minted access token means the
+	// authorization behind it is no longer good.
+	var statusErr *client.StatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnauthorized {
+		return credentialsRejected
+	}
+
+	return credentialsUnknown
 }
 
 func runServer() error {
@@ -235,17 +300,24 @@ func serve(server *http.Server, listener net.Listener) error {
 	}
 }
 
+// runCommand is a seam for testing the deployment sequence without a fly CLI
+// to run, and without real credentials to hand it.
+var runCommand = func(name string, stdin io.Reader, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 func setFlySecrets() error {
-	secrets := map[string]string{
-		"SPOTIFY_CLIENT_ID":     os.Getenv("SPOTIFY_CLIENT_ID"),
-		"SPOTIFY_CLIENT_SECRET": os.Getenv("SPOTIFY_CLIENT_SECRET"),
-		"SPOTIFY_REFRESH_TOKEN": os.Getenv("SPOTIFY_REFRESH_TOKEN"),
-	}
+	// Ordered, so that what is piped in doesn't depend on map iteration.
+	names := []string{"SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_REFRESH_TOKEN"}
 
 	var lines []string
-	for key, value := range secrets {
-		if value != "" {
-			lines = append(lines, fmt.Sprintf("%s=%s", key, value))
+	for _, name := range names {
+		if value := os.Getenv(name); value != "" {
+			lines = append(lines, fmt.Sprintf("%s=%s", name, value))
 		}
 	}
 
@@ -256,30 +328,31 @@ func setFlySecrets() error {
 	log.Println("Setting Fly.io secrets...")
 	// Piped in rather than passed as arguments, which any other process on the
 	// machine could read out of the process list while this runs.
-	cmd := exec.Command("fly", "secrets", "import")
-	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	stdin := strings.NewReader(strings.Join(lines, "\n") + "\n")
+
+	return runCommand("fly", stdin, "secrets", "import")
 }
 
-func deploy() {
+// deploy pushes the local credentials up as Fly secrets and then deploys.
+//
+// The order matters, and so does stopping: deploying after a failed secrets
+// import publishes new code against whatever secrets happen to be up there
+// already — the previous account's, or none at all.
+func deploy() error {
 	if err := assertEnvVariablesExist(); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	if err := setFlySecrets(); err != nil {
-		log.Printf("Warning: Failed to set secrets: %v", err)
-		log.Println("You may need to set them manually if this is your first deployment")
+		return fmt.Errorf("failed to set Fly.io secrets, so nothing was deployed: %w", err)
 	}
 
 	log.Println("Deploying to Fly.io...")
-	cmd := exec.Command("fly", "deploy")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("Fly deployment failed: %v", err)
+	if err := runCommand("fly", nil, "deploy"); err != nil {
+		return fmt.Errorf("fly deployment failed: %w", err)
 	}
+
+	return nil
 }
 
 // loadEnvFile pulls in .env if there is one. A missing file isn't fatal by
@@ -296,8 +369,14 @@ func loadEnvFile() {
 // persists it. Running the flow in process rather than shelling out means the
 // token is available to the rest of this run immediately.
 func ensureAuth(isProduction, reset bool) error {
-	if !reset && !needsAuth() {
-		return nil
+	if !reset {
+		required, err := needsAuth()
+		if err != nil {
+			return err
+		}
+		if !required {
+			return nil
+		}
 	}
 
 	id, secret := os.Getenv("SPOTIFY_CLIENT_ID"), os.Getenv("SPOTIFY_CLIENT_SECRET")
@@ -332,10 +411,11 @@ func ensureAuth(isProduction, reset bool) error {
 	return nil
 }
 
-// needsAuth reports whether the stored refresh token is missing or rejected.
-func needsAuth() bool {
+// needsAuth reports whether the stored refresh token is missing or has been
+// rejected, and returns an error for a problem authorizing won't solve.
+func needsAuth() (bool, error) {
 	if os.Getenv("SPOTIFY_REFRESH_TOKEN") == "" {
-		return true
+		return true, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
@@ -344,7 +424,19 @@ func needsAuth() bool {
 	spotifyClient := client.NewSpotifyClient()
 	_, err := spotifyClient.GetCurrentlyPlaying(ctx)
 
-	return err != nil && (strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401"))
+	switch classifyCredentials(err) {
+	case credentialsRejected:
+		return true, nil
+	case credentialsMisconfigured:
+		return false, fmt.Errorf("spotify rejected the client ID and secret: %w\n\n%s", err, setupHelp)
+	case credentialsUnknown:
+		// Spotify being unreachable is no reason to throw away a refresh token
+		// that is probably fine, or to sit waiting on a browser login.
+		log.Printf("Couldn't check the stored refresh token, carrying on with it: %v", err)
+		return false, nil
+	}
+
+	return false, nil
 }
 
 // writeToEnvFile stores the refresh token in .env, leaving any other values in
@@ -359,8 +451,10 @@ func writeToEnvFile(refreshToken string) error {
 		return fmt.Errorf("couldn't read .env to update it: %w", err)
 	}
 
-	if err == nil {
-		lines := strings.Split(string(existingContent), "\n")
+	if err == nil && len(existingContent) > 0 {
+		// The trailing newline is taken off and put back, so that a replacement
+		// lands on the last line rather than after the empty one it leaves.
+		lines := strings.Split(strings.TrimSuffix(string(existingContent), "\n"), "\n")
 		var newLines []string
 		found := false
 
@@ -377,10 +471,57 @@ func writeToEnvFile(refreshToken string) error {
 			newLines = append(newLines, fmt.Sprintf("SPOTIFY_REFRESH_TOKEN=%s", refreshToken))
 		}
 
-		envContent = strings.Join(newLines, "\n")
+		envContent = strings.Join(newLines, "\n") + "\n"
 	}
 
-	return os.WriteFile(".env", []byte(envContent), 0600)
+	return replaceFile(".env", []byte(envContent))
+}
+
+// renameFile is a seam for testing what a failed replacement leaves behind.
+var renameFile = os.Rename
+
+// replaceFile writes data to path as a private file, atomically.
+//
+// os.WriteFile would be shorter, but its permissions only apply to a file it
+// creates: a .env copied from the template stays 0644, readable by anything
+// else on the machine. It also truncates the file it is replacing before
+// writing, so a failure halfway leaves neither the old credentials nor the new
+// ones. Writing alongside and renaming over gives every reader either the old
+// file or the new one.
+func replaceFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("couldn't create a temporary file next to %s: %w", path, err)
+	}
+	// Named now, because the file is gone from under this name once renamed.
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // a no-op once the rename has succeeded
+
+	// CreateTemp is already 0600, but say so rather than depending on it: this
+	// file holds a refresh token from the moment it is written.
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("couldn't restrict permissions on %s: %w", tmpName, err)
+	}
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("couldn't write %s: %w", tmpName, err)
+	}
+
+	// Checked, not deferred: a write can fail on close, and renaming a
+	// truncated file over the credentials would lose them.
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("couldn't finish writing %s: %w", tmpName, err)
+	}
+
+	if err := renameFile(tmpName, path); err != nil {
+		return fmt.Errorf("couldn't replace %s: %w", path, err)
+	}
+
+	return nil
 }
 
 func main() {
@@ -394,7 +535,9 @@ func main() {
 		if err := ensureAuth(true, *resetAuthFlag); err != nil {
 			log.Fatal(err)
 		}
-		deploy()
+		if err := deploy(); err != nil {
+			log.Fatal(err)
+		}
 	case "local":
 		loadEnvFile()
 		if err := ensureAuth(false, *resetAuthFlag); err != nil {
