@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,4 +160,65 @@ func slicesContains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// A .env copied from the template is 0644, and os.WriteFile's permissions only
+// apply to a file it creates — so writing the token into one left it readable
+// by anything else on the machine.
+func TestWriteToEnvFileTightensAnExistingFile(t *testing.T) {
+	inTempDir(t)
+
+	if err := os.WriteFile(".env", []byte("SPOTIFY_CLIENT_ID=abc\n"), 0644); err != nil {
+		t.Fatalf("couldn't seed .env: %v", err)
+	}
+
+	if err := writeToEnvFile("token-1"); err != nil {
+		t.Fatalf("writeToEnvFile() returned error: %v", err)
+	}
+
+	info, err := os.Stat(".env")
+	if err != nil {
+		t.Fatalf("couldn't stat .env: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf(".env mode = %o, want 600: an existing world-readable file kept its permissions", perm)
+	}
+}
+
+// If the replacement fails, the credentials that were there have to still be
+// there — and the half-written copy holding a refresh token must not be left
+// lying around.
+func TestWriteToEnvFileKeepsCredentialsWhenReplacementFails(t *testing.T) {
+	inTempDir(t)
+
+	existing := "SPOTIFY_CLIENT_ID=abc\nSPOTIFY_REFRESH_TOKEN=old\n"
+	if err := os.WriteFile(".env", []byte(existing), 0600); err != nil {
+		t.Fatalf("couldn't seed .env: %v", err)
+	}
+
+	original := renameFile
+	renameFile = func(string, string) error { return errors.New("no space left on device") }
+	t.Cleanup(func() { renameFile = original })
+
+	if err := writeToEnvFile("new"); err == nil {
+		t.Fatal("writeToEnvFile() succeeded though the replacement failed")
+	}
+
+	content, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatalf("couldn't read .env: %v", err)
+	}
+	if string(content) != existing {
+		t.Errorf("the original credentials were lost:\n%s", content)
+	}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("couldn't list the directory: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != ".env" {
+			t.Errorf("left %q behind, which holds the refresh token", entry.Name())
+		}
+	}
 }

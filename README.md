@@ -65,6 +65,10 @@ playing, 1 minute for recently played, 30 minutes for the top charts. Once warm,
 stale data is served immediately and refreshed in the background, so requests
 don't wait on Spotify.
 
+That grace runs for 10 minutes past the TTL, so a chart is served while it
+refreshes until it is 40 minutes old. Past that it's too old to pass off as
+current, and a request waits for fresh data rather than being handed it.
+
 ## Deployment
 
 Pushing to `main` deploys via GitHub Actions, once the build, vet, tests and

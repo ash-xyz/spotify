@@ -32,6 +32,23 @@ var scopes = []string{
 	"user-read-recently-played",
 }
 
+const (
+	// How long the callback's code-for-token exchange gets. Spotify holding
+	// the connection open shouldn't be able to keep the callback server, and
+	// so the whole authorization run, alive indefinitely.
+	exchangeTimeout = 30 * time.Second
+
+	// How long the callback server gets to finish serving the page that says
+	// authorization worked, once there's nothing left to wait for.
+	shutdownGrace = 5 * time.Second
+)
+
+// Seams for tests, which can neither open a browser nor reach Spotify.
+var (
+	openBrowser  = browser.OpenURL
+	authEndpoint = spotify.Endpoint
+)
+
 // RedirectURI returns the callback to use, overridable for anyone whose
 // dashboard has something other than the default registered.
 func RedirectURI() string {
@@ -66,8 +83,14 @@ func Run(ctx context.Context, clientID, clientSecret string) (string, error) {
 		ClientSecret: clientSecret,
 		RedirectURL:  redirect.String(),
 		Scopes:       scopes,
-		Endpoint:     spotify.Endpoint,
+		Endpoint:     authEndpoint,
 	}
+
+	// Everything this run starts hangs off here, so that returning — whether
+	// the user finished, gave up, or ctx expired — also ends any token
+	// exchange still in flight rather than leaving it to run on unattended.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	state, err := generateStateToken()
 	if err != nil {
@@ -89,7 +112,7 @@ func Run(ctx context.Context, clientID, clientSecret string) (string, error) {
 
 	results := make(chan result, 1)
 	mux := http.NewServeMux()
-	mux.HandleFunc(redirect.Path, completeAuth(cfg, state, results))
+	mux.HandleFunc(redirect.Path, completeAuth(ctx, cfg, state, results))
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -98,10 +121,21 @@ func Run(ctx context.Context, clientID, clientSecret string) (string, error) {
 		IdleTimeout:       30 * time.Second,
 	}
 	go server.Serve(listener)
-	defer server.Shutdown(context.Background())
+
+	// Bounded, because Shutdown waits on in-flight requests: an unbounded one
+	// would wait out a callback that never finishes.
+	defer func() {
+		// Cancelled first, since a callback still waiting on the token
+		// exchange is exactly what Shutdown would otherwise sit behind.
+		cancel()
+
+		shutdownCtx, stop := context.WithTimeout(context.Background(), shutdownGrace)
+		defer stop()
+		server.Shutdown(shutdownCtx)
+	}()
 
 	authURL := cfg.AuthCodeURL(state, oauth2.SetAuthURLParam("show_dialog", "true"))
-	if err := browser.OpenURL(authURL); err != nil {
+	if err := openBrowser(authURL); err != nil {
 		// Not fatal: the user can follow the link themselves, which is the only
 		// option on a machine without a browser to open.
 		fmt.Println("Couldn't open a browser automatically. Visit this URL to authorize:")
@@ -116,7 +150,10 @@ func Run(ctx context.Context, clientID, clientSecret string) (string, error) {
 	}
 }
 
-func completeAuth(cfg *oauth2.Config, state string, results chan<- result) http.HandlerFunc {
+// completeAuth serves the callback. runCtx is the authorization run's own
+// context: the exchange is bound to it so that giving up on the run gives up
+// on the exchange too.
+func completeAuth(runCtx context.Context, cfg *oauth2.Config, state string, results chan<- result) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// finish reports the outcome to Run exactly once. The buffered channel
 		// means a duplicate callback can't block a handler forever.
@@ -146,7 +183,10 @@ func completeAuth(cfg *oauth2.Config, state string, results chan<- result) http.
 			return
 		}
 
-		token, err := cfg.Exchange(r.Context(), code)
+		ctx, cancel := context.WithTimeout(runCtx, exchangeTimeout)
+		defer cancel()
+
+		token, err := cfg.Exchange(ctx, code)
 		if err != nil {
 			http.Error(w, "Failed to exchange code for token", http.StatusInternalServerError)
 			finish(fmt.Errorf("failed to exchange code for token: %w", err))

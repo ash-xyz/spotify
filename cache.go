@@ -39,22 +39,29 @@ const sectionCount = 4
 type section[T any] struct {
 	name string
 	ttl  time.Duration
-	// maxStale bounds how long stale data may be served when refreshes are
-	// failing. Zero means unbounded.
+	// maxStale is how long past the TTL stale data may still be served while
+	// refreshes are failing. Zero means unbounded.
 	maxStale time.Duration
 	fetch    func(context.Context) (T, error)
 
-	mu         sync.Mutex
-	val        T
-	fetchedAt  time.Time
-	cached     bool
-	refreshing bool
-	failedAt   time.Time
-	lastErr    error
+	mu        sync.Mutex
+	val       T
+	fetchedAt time.Time
+	cached    bool
+	failedAt  time.Time
+	lastErr   error
+	// inflight is the fetch currently running, if any. Everyone who arrives
+	// while it runs waits on it, so concurrent callers on a cold cache make
+	// one request to Spotify between them rather than one each.
+	inflight *fetchCall[T]
+}
 
-	// Held for the duration of a fetch so that concurrent callers on a cold
-	// cache make one request to Spotify between them rather than one each.
-	fetchMu sync.Mutex
+// fetchCall is a single fetch of a section, shared by every caller waiting on
+// it. The value it carries is written once, before done is closed.
+type fetchCall[T any] struct {
+	done chan struct{}
+	val  T
+	err  error
 }
 
 func (s *section[T]) get(ctx context.Context) (T, error) {
@@ -67,7 +74,10 @@ func (s *section[T]) get(ctx context.Context) (T, error) {
 	}
 
 	// Refresh behind the caller while what we hold is still worth showing.
-	if cached && (s.maxStale == 0 || age < s.maxStale) {
+	// maxStale is an allowance on top of the TTL, not a total lifetime: a
+	// 30 minute chart with a 10 minute allowance may be served up to 40
+	// minutes old.
+	if cached && (s.maxStale == 0 || age < s.ttl+s.maxStale) {
 		if !s.inBackoff() {
 			s.refreshInBackground()
 		}
@@ -79,31 +89,20 @@ func (s *section[T]) get(ctx context.Context) (T, error) {
 	return s.refresh(ctx)
 }
 
-// refreshInBackground refreshes a stale section without blocking the caller. At
-// most one refresh runs at a time, so a burst of requests can't pile up
-// goroutines all fetching the same thing.
+// refreshInBackground refreshes a stale section without blocking the caller.
 func (s *section[T]) refreshInBackground() {
 	s.mu.Lock()
-	if s.refreshing {
-		s.mu.Unlock()
-		return
-	}
-	s.refreshing = true
+	running := s.inflight != nil
 	s.mu.Unlock()
 
+	if running {
+		return
+	}
+
 	go func() {
-		defer func() {
-			s.mu.Lock()
-			s.refreshing = false
-			s.mu.Unlock()
-		}()
-
-		// The request that triggered this refresh is already answered, so use a
-		// fresh context rather than one that's about to be cancelled.
-		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-		defer cancel()
-
-		if _, err := s.refresh(ctx); err != nil {
+		// The request that triggered this refresh is already answered, so
+		// nothing here should be waiting on that caller's context.
+		if _, err := s.refresh(context.Background()); err != nil {
 			log.Printf("Background refresh of %s failed: %v", s.name, err)
 		}
 	}()
@@ -118,42 +117,83 @@ func (s *section[T]) inBackoff() bool {
 	return !s.failedAt.IsZero() && time.Since(s.failedAt) < failureBackoff
 }
 
+// refresh waits for a current value, sharing one fetch with any other caller
+// waiting on the same section. A caller that gives up leaves the fetch running
+// for the others: the work belongs to the section, not to whoever triggered it.
 func (s *section[T]) refresh(ctx context.Context) (T, error) {
-	s.fetchMu.Lock()
-	defer s.fetchMu.Unlock()
+	call := s.startFetch()
 
-	// Another caller may have refreshed while we waited for the lock.
-	s.mu.Lock()
-	val, cached, age := s.val, s.cached, time.Since(s.fetchedAt)
-	failedAt, lastErr := s.failedAt, s.lastErr
-	s.mu.Unlock()
-
-	if cached && age < s.ttl {
-		return val, nil
-	}
-
-	if !failedAt.IsZero() && time.Since(failedAt) < failureBackoff {
+	select {
+	case <-call.done:
+		return call.val, call.err
+	case <-ctx.Done():
+		// This caller's own doing, so it isn't a failure of the section and
+		// mustn't put it into backoff for everyone else.
 		var zero T
-		return zero, fmt.Errorf("not retrying %s for another %s: %w",
-			s.name, (failureBackoff - time.Since(failedAt)).Round(time.Second), lastErr)
+		return zero, fmt.Errorf("gave up waiting for %s: %w", s.name, ctx.Err())
 	}
+}
+
+// startFetch returns the fetch to wait on: the one already running, a new one,
+// or an already finished one carrying whatever made a fetch unnecessary.
+func (s *section[T]) startFetch() *fetchCall[T] {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.inflight != nil {
+		return s.inflight
+	}
+
+	// Another caller may have refreshed while this one was on its way here.
+	if s.cached && time.Since(s.fetchedAt) < s.ttl {
+		return finishedFetch(s.val, nil)
+	}
+
+	if !s.failedAt.IsZero() && time.Since(s.failedAt) < failureBackoff {
+		var zero T
+		return finishedFetch(zero, fmt.Errorf("not retrying %s for another %s: %w",
+			s.name, (failureBackoff-time.Since(s.failedAt)).Round(time.Second), s.lastErr))
+	}
+
+	call := &fetchCall[T]{done: make(chan struct{})}
+	s.inflight = call
+
+	go s.runFetch(call)
+
+	return call
+}
+
+// runFetch does the work behind an in-flight fetch. It has its own timeout
+// rather than a caller's context: the visitor who triggered it may disconnect
+// at any moment, and other visitors are waiting on the same result.
+func (s *section[T]) runFetch(call *fetchCall[T]) {
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+	defer cancel()
 
 	val, err := s.fetch(ctx)
-	if err != nil {
-		s.mu.Lock()
-		s.failedAt, s.lastErr = time.Now(), err
-		s.mu.Unlock()
-
-		var zero T
-		return zero, err
-	}
 
 	s.mu.Lock()
-	s.val, s.fetchedAt, s.cached = val, time.Now(), true
-	s.failedAt, s.lastErr = time.Time{}, nil
+	if err != nil {
+		s.failedAt, s.lastErr = time.Now(), err
+		var zero T
+		val = zero
+	} else {
+		s.val, s.fetchedAt, s.cached = val, time.Now(), true
+		s.failedAt, s.lastErr = time.Time{}, nil
+	}
+	s.inflight = nil
 	s.mu.Unlock()
 
-	return val, nil
+	// Safe to write without the lock: nothing reads these before the channel
+	// closes.
+	call.val, call.err = val, err
+	close(call.done)
+}
+
+func finishedFetch[T any](val T, err error) *fetchCall[T] {
+	call := &fetchCall[T]{done: make(chan struct{}), val: val, err: err}
+	close(call.done)
+	return call
 }
 
 // spotifyCache fronts every endpoint the API exposes.
